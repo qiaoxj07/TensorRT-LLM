@@ -530,12 +530,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #if !DISABLE_SYNC_FOR_PROFILING
             uint32_t expected_value = *ptrs.flag_val;
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-            // .acquire and .release qualifiers for fence instruction require sm_90 or higher.
             asm volatile("fence.release.sys;");
-#else
-            asm volatile("fence.acq_rel.sys;");
-#endif
 #pragma unroll 1 // No unroll as one iter is typically enough
             for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize)
             {
@@ -576,6 +571,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                     return;
                 }
             }
+            // asm volatile("fence.acquire.sys;");
 #endif
         }
     }
@@ -1088,6 +1084,7 @@ __global__ void moeA2ACombineKernel(
 
         if (blockIdx.x == 0)
         {
+            // asm volatile("fence.release.sys;");
 #pragma unroll 1 // No unroll
             for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
             {
@@ -1128,12 +1125,7 @@ __global__ void moeA2ACombineKernel(
                 return;
             }
         }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-        // .acquire and .release qualifiers for fence instruction require sm_90 or higher.
         asm volatile("fence.acquire.sys;");
-#else
-        asm volatile("fence.acq_rel.sys;");
-#endif
     }
     __syncthreads();
 #endif

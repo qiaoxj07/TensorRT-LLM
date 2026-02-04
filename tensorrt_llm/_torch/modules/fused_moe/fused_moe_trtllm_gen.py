@@ -725,7 +725,7 @@ class TRTLLMGenFusedMoE(MoE):
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
                 -2] // 2
 
-            result = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
+            final_hidden_states = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
                 x,
@@ -755,10 +755,6 @@ class TRTLLMGenFusedMoE(MoE):
                 token_selected_experts,
                 output=moe_output,
             )
-
-            # When output is provided, use it directly as the result
-            # (custom op returns empty tensor to avoid PyTorch aliasing constraints)
-            final_hidden_states = moe_output if moe_output is not None else result
         else:
             raise NotImplementedError(
                 "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_mxfp8 and w4a8_mxfp4_fp8 dtypes."

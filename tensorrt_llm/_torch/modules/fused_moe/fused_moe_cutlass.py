@@ -264,12 +264,13 @@ class CutlassFusedMoE(MoE):
         # The default value is max_num_tokens * dp_size
         self.moe_max_num_tokens = model_config.moe_max_num_tokens
         # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
-        default_moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
+        default_moe_max_num_tokens = model_config.max_num_tokens * \
+            model_config.mapping.dp_size
         if self.moe_max_num_tokens < default_moe_max_num_tokens:
             self.aux_stream = aux_stream_dict[
                 AuxStreamType.
                 MoeChunkingOverlap] if aux_stream_dict is not None else torch.cuda.Stream(
-                )
+            )
             self.event_dict = {
                 key: torch.cuda.Event()
                 for key in [EventType.Main, EventType.MoeChunkingOverlap]
@@ -629,13 +630,10 @@ class CutlassFusedMoE(MoE):
             unpadded_hidden_size=self.unpadded_hidden_size,
             out_tensor=moe_output,
         )
-        # When moe_output is provided, the result is written in-place and
-        # fused_moe returns empty list to avoid aliasing constraint violation.
-        # Otherwise, unpack the single tensor from the returned list.
-        if moe_output is not None:
-            final_hidden_states = moe_output
-        else:
-            final_hidden_states = result[0]
+        # Custom op requires all inputs are in the same type.
+        # Only in cutlass_min_latency_mode, the output is a list of tensors.
+        # Otherwise, the output should be unpacked as a single tensor.
+        final_hidden_states = result[0]
 
         return final_hidden_states
 
@@ -719,7 +717,8 @@ class CutlassFusedMoE(MoE):
         # Alltoall or allgather for attention DP
         token_count = x.shape[0]
         alltoall_info = None  # Store for later combine
-        is_sf_swizzled = True  # In case of post-quant communication, scaling factors will not be swizzled before communication, and swizzling after communication is merged into MoE.
+        # In case of post-quant communication, scaling factors will not be swizzled before communication, and swizzling after communication is merged into MoE.
+        is_sf_swizzled = True
         if self.enable_alltoall:
             assert all_rank_num_tokens is not None, "all_rank_num_tokens required for alltoall"
             # Prepare alltoall indices
@@ -1018,7 +1017,8 @@ class CutlassFusedMoE(MoE):
         if self.use_dp and self.parallel_size > 1:
             rank = self.parallel_rank
             outputs = outputs[:all_rank_num_tokens[rank]]
-        self.repeat_idx = 0 if self.repeat_idx == self.repeat_count - 1 else self.repeat_idx + 1
+        self.repeat_idx = 0 if self.repeat_idx == self.repeat_count - \
+            1 else self.repeat_idx + 1
         return outputs
 
     def forward_fake(
