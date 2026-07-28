@@ -221,6 +221,18 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
     // Returns how many leading tokens match `otherTokens`.
     int partialMatchThisNode(TokenIdExt const* otherTokens, size_t count) const;
 
+    // True if this block can stand in for a shorter sibling ending at
+    // `numTokens`: it must hold a committed page for every lifecycle, and — when
+    // an SSM lifecycle exists — its SSM snapshot must sit exactly on that token
+    // boundary. Mirrors Python's Block._can_replace_token_span().
+    bool canReplaceTokenSpan(int numTokens, std::optional<LifeCycleId> ssmLcId) const;
+
+    // Detach shorter siblings whose tokens this block covers, but only those
+    // whose reusable state this block actually preserves. Called from the commit
+    // path once the replacement state is committed, NOT at block creation.
+    // Mirrors Python's Block.remove_redundant_covered_siblings().
+    void removeRedundantCoveredSiblings(std::optional<LifeCycleId> ssmLcId);
+
     // Break the bidirectional link to the cached page for a lifecycle.
     // Returns the previously-stored CommittedPage* (nullptr if already unlinked).
     // If `expectedPage` is non-null and the stored page differs from it, the link
@@ -313,7 +325,22 @@ public:
     }
 
 private:
-    std::vector<MatchResult> matchTokenPath(
+    // A partial-match sibling that branches off the exact token path after
+    // `prefixLen` matched blocks. Mirrors the (prefix_len, candidate) tuples
+    // Python's _match_token_path() returns alongside the exact path.
+    struct FallbackCandidate
+    {
+        int prefixLen;
+        MatchResult candidate;
+    };
+
+    struct TokenPathMatch
+    {
+        std::vector<MatchResult> path;
+        std::vector<FallbackCandidate> fallbacks;
+    };
+
+    TokenPathMatch matchTokenPath(
         ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch) const;
     ReuseMatch pruneMatch(std::vector<MatchResult> matched) const;
 
@@ -335,11 +362,14 @@ private:
 
 // Add a block to prev's `next` map, or return the existing one on collision.
 // Throws UselessBlockError (with the sibling block) if the block's tokens are a
-// prefix of an existing sibling — mirrors Python's UselessBlockError.
+// prefix of an existing sibling that can already serve this endpoint — mirrors
+// Python's UselessBlockError. `ssmLcId` is the tree's SSM lifecycle (if any); it
+// is passed in rather than looked up because a Block has no back-pointer to the
+// tree's LifeCycleRegistry.
 // If isNew is non-null, *isNew is set to true if a new block was created, false
 // if an existing block was returned.
-SharedPtr<Block> addOrGetExistingBlock(
-    NodeBase* prev, LifeCycleId numLifeCycles, std::vector<TokenIdExt> tokens, bool* isNew = nullptr);
+SharedPtr<Block> addOrGetExistingBlock(NodeBase* prev, LifeCycleId numLifeCycles, std::vector<TokenIdExt> tokens,
+    std::optional<LifeCycleId> ssmLcId, bool* isNew = nullptr);
 
 // Post-order traversal: remove a subtree rooted at `root` from its parent's
 // next map. ~Block() handles page cleanup. Mirrors Python's remove_subtree().

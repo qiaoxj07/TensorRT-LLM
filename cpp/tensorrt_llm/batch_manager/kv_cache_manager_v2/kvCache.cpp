@@ -906,11 +906,12 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
         prevNode = _getTreeBlock(BlockOrdinal{ordinal.value() - 1}).get();
     }
 
+    auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     bool isNew = false;
     SharedPtr<Block> treeBlock;
     try
     {
-        treeBlock = addOrGetExistingBlock(prevNode, numLc, tokens, &isNew);
+        treeBlock = addOrGetExistingBlock(prevNode, numLc, tokens, ssmLcId, &isNew);
     }
     catch (UselessBlockError const& e)
     {
@@ -921,7 +922,6 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
     TLLM_CHECK_DEBUG(isNew || std::equal(tokens.begin(), tokens.end(), treeBlock->tokens.begin()));
 
     auto& beamBlock = mBlocks.at(ordinal).pages[kDefaultBeamIndex];
-    auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     // Only attach partial attention pages to a tree block whose token span is
     // exactly the partial snapshot. A longer existing sibling may already have
     // full attention pages; otherwise a partial page would make it look more
@@ -948,6 +948,10 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
     {
         treeBlock->eventSink->addStoredBlock(*treeBlock);
     }
+    // Now that this block carries the snapshot state, shorter siblings it fully
+    // subsumes can go. Deferred to here (rather than block creation) so a
+    // rewind endpoint is never dropped before its replacement exists.
+    treeBlock->removeRedundantCoveredSiblings(ssmLcId);
 }
 
 // ---------------------------------------------------------------------------
@@ -1537,11 +1541,12 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
     // Try to find or create a block in the radix tree.
     // Mirrors Python's try/except UselessBlockError pattern.
     // TODO: Replace with if-condition once Python is removed and C++ is the primary codebase.
+    auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     bool blockIsNew = false;
     SharedPtr<Block> newBlock;
     try
     {
-        newBlock = addOrGetExistingBlock(prevNode, numLc, tokenBlock, &blockIsNew);
+        newBlock = addOrGetExistingBlock(prevNode, numLc, tokenBlock, ssmLcId, &blockIsNew);
     }
     catch (UselessBlockError const& e)
     {
@@ -1553,7 +1558,6 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
     // In reuse case, verify token match (mirrors Python: tree_block.tokens[:num_tokens] == tokens).
     TLLM_CHECK_DEBUG(blockIsNew || std::equal(tokenBlock.begin(), tokenBlock.end(), newBlock->tokens.begin()));
 
-    auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     bool didCommit = false;
 
     if (blockIsNew)
@@ -1670,6 +1674,13 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
     {
         TLLM_CHECK_DEBUG(ssmLcId.has_value());
         _snapshotSsmToTreeBlock(newBlock, *ssmLcId, start + static_cast<int>(tokenBlock.size()), moveSsm);
+    }
+
+    if (didCommit)
+    {
+        // Only once the replacement state is committed may shorter covered
+        // siblings be dropped (see Block::removeRedundantCoveredSiblings()).
+        newBlock->removeRedundantCoveredSiblings(ssmLcId);
     }
 
     if (sb.isCommitted())

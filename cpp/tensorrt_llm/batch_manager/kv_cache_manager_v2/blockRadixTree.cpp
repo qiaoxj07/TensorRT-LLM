@@ -393,6 +393,63 @@ int Block::partialMatchThisNode(TokenIdExt const* otherTokens, size_t otherCount
     return count;
 }
 
+bool Block::canReplaceTokenSpan(int numTokens, std::optional<LifeCycleId> ssmLcId) const
+{
+    // Every lifecycle must still hold a committed page: a block missing one
+    // cannot serve a reuse request that a shorter sibling could have served.
+    for (auto const* page : storage)
+    {
+        if (page == nullptr)
+        {
+            return false;
+        }
+    }
+
+    // An SSM snapshot is only reusable at the exact token boundary it was taken
+    // at, so a longer block only subsumes the shorter endpoint when its own
+    // snapshot sits on that boundary.
+    if (ssmLcId.has_value())
+    {
+        auto* ssmPage = dynamic_cast<SsmCommittedPage*>(storage.at(*ssmLcId));
+        TLLM_CHECK_DEBUG(ssmPage != nullptr);
+        if (ssmPage == nullptr || ssmPage->numTokensInBlock != numTokens)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+void Block::removeRedundantCoveredSiblings(std::optional<LifeCycleId> ssmLcId)
+{
+    if (prev == nullptr)
+    {
+        return;
+    }
+
+    std::vector<BlockKey> toRemove;
+    for (auto const& [siblingKey, sibling] : prev->next)
+    {
+        if (sibling->tokens.size() < tokens.size() && isPrefix(sibling->tokens, tokens)
+            && canReplaceTokenSpan(static_cast<int>(sibling->tokens.size()), ssmLcId))
+        {
+            TLLM_CHECK_DEBUG(!sibling->isFull() && sibling.get() != this && sibling->key == siblingKey
+                && sibling->next.empty());
+            toRemove.push_back(siblingKey);
+        }
+    }
+
+    for (auto const& siblingKey : toRemove)
+    {
+        // Unlike Python, detachNext() emits the removed-block event itself, so
+        // the caller must NOT emit a second one here.
+        auto erased = prev->detachNext(siblingKey);
+        TLLM_CHECK_DEBUG(erased);
+        TLLM_CHECK_DEBUG_WITH_INFO(erased->isOrphan(), "erased sibling must be orphan after removal");
+        (void) erased;
+    }
+}
+
 CommittedPage* Block::unlinkPage(LifeCycleId lcIdx, CommittedPage* expectedPage)
 {
     auto& slot = storage.at(lcIdx);
@@ -459,8 +516,8 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
 // addOrGetExistingBlock
 // ---------------------------------------------------------------------------
 
-SharedPtr<Block> addOrGetExistingBlock(
-    NodeBase* prev, LifeCycleId numLifeCycles, std::vector<TokenIdExt> tokens, bool* isNew)
+SharedPtr<Block> addOrGetExistingBlock(NodeBase* prev, LifeCycleId numLifeCycles, std::vector<TokenIdExt> tokens,
+    std::optional<LifeCycleId> ssmLcId, bool* isNew)
 {
     TLLM_CHECK_DEBUG_WITH_INFO(prev, "prev must not be null");
 
@@ -483,34 +540,26 @@ SharedPtr<Block> addOrGetExistingBlock(
         return it->second;
     }
 
-    // Useless check: is this block's token prefix covered by a sibling?
+    // Useless check: is this block's token prefix covered by a sibling that
+    // already preserves everything needed to reuse this endpoint? A longer
+    // sibling that has not committed all lifecycles (or whose SSM snapshot sits
+    // at a different token boundary) does NOT subsume this endpoint, so the
+    // partial block must still be created.
     // Mirrors Python's UselessBlockError — throw with the sibling block.
     if (static_cast<int>(tokens.size()) < tpb)
     {
         for (auto const& [k, sibling] : prevNext)
         {
-            if (sibling->tokens.size() >= tokens.size() && isPrefix(tokens, sibling->tokens))
+            if (sibling->tokens.size() >= tokens.size() && isPrefix(tokens, sibling->tokens)
+                && sibling->canReplaceTokenSpan(static_cast<int>(tokens.size()), ssmLcId))
                 throw UselessBlockError(sibling);
         }
     }
 
-    // Remove siblings whose tokens are a strict prefix of ours.
-    std::vector<BlockKey> toRemove;
-    for (auto const& [k, sibling] : prevNext)
-    {
-        if (sibling->tokens.size() < tokens.size() && isPrefix(sibling->tokens, tokens))
-        {
-            TLLM_CHECK_DEBUG(!sibling->isFull() && sibling->key == k && sibling->next.empty());
-            toRemove.push_back(k);
-        }
-    }
-    for (auto const& k : toRemove)
-    {
-        auto erasedBlock = prev->detachNext(k);
-        TLLM_CHECK_DEBUG(erasedBlock);
-        TLLM_CHECK_DEBUG_WITH_INFO(erasedBlock->isOrphan(), "erased sibling must be orphan after removal");
-        (void) erasedBlock;
-    }
+    // Siblings covered by this block are NOT removed here. Removal is deferred to
+    // Block::removeRedundantCoveredSiblings(), which the commit path calls once
+    // the replacement state has actually been committed. Removing them eagerly
+    // would drop a reusable rewind endpoint that this block cannot yet serve.
 
     // Create the new block. ordinal and tokensPerBlock are derived from prev inside the Block ctor.
     auto block = makeShared<Block>(newKey, std::move(tokens), prev, numLifeCycles);
@@ -629,27 +678,27 @@ RootBlock& BlockRadixTree::addOrGetExisting(ReuseScope const& reuseScope)
     return *newIt->second;
 }
 
-// Among all child nodes, find the one whose tokens have the longest leading match.
-// Returns (block, numMatchedTokens) or (nullptr, 0) if no match.
-// Mirrors Python's find_best_partial_match_in_next_nodes().
-std::pair<Block*, int> findBestPartialMatchInNextNodes(
+// Return every child node with a non-empty leading token match. The caller
+// decides which one wins, because raw match length does not predict how many
+// tokens survive lifecycle pruning.
+// Mirrors Python's find_partial_matches_in_next_nodes().
+std::vector<BlockRadixTree::MatchResult> findPartialMatchesInNextNodes(
     std::unordered_map<BlockKey, SharedPtr<Block>> const& nextMap, TokenIdExt const* tokens, size_t tokenCount)
 {
+    std::vector<BlockRadixTree::MatchResult> matches;
     // Skip heuristic: too many children would be slow to iterate.
+    // TODO: build a database to accelerate partial matching. (TRTLLM-7784)
     if (nextMap.size() >= 32)
-        return {nullptr, 0};
-    Block* best = nullptr;
-    int bestMatch = 0;
+        return matches;
     for (auto const& [k, child] : nextMap)
     {
         int m = child->partialMatchThisNode(tokens, tokenCount);
-        if (m > bestMatch)
+        if (m > 0)
         {
-            bestMatch = m;
-            best = child.get();
+            matches.push_back({child.get(), m});
         }
     }
-    return {best, bestMatch};
+    return matches;
 }
 
 namespace
@@ -671,12 +720,12 @@ bool hasPage(Block const& block, LifeCycleId lcId)
 
 } // anonymous namespace
 
-std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
+BlockRadixTree::TokenPathMatch BlockRadixTree::matchTokenPath(
     ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch) const
 {
     drainPendingRootErases();
 
-    std::vector<MatchResult> results;
+    TokenPathMatch results;
 
     // Lazily compute one key per iteration — no wasted hashing on early miss.
     auto gen = makeBlockchainKeyGenerator(mTokensPerBlock, reuseScope, tokens.data(), tokens.size());
@@ -706,7 +755,21 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
         size_t beg = toSizeT(ordinal) * static_cast<size_t>(mTokensPerBlock);
         int numTokens = static_cast<int>(std::min(static_cast<size_t>(mTokensPerBlock), tokens.size() - beg));
         Block* block = blockIt->second.get();
-        results.push_back({block, numTokens});
+        // A shorter sibling of the exact next block may survive lifecycle
+        // pruning where the exact path does not. Record it as a branch point so
+        // match() can fall back to it instead of returning a shorter prefix.
+        if (enablePartialMatch && currentNext->size() > 1)
+        {
+            for (auto const& candidate :
+                findPartialMatchesInNextNodes(*currentNext, tokens.data() + beg, static_cast<size_t>(numTokens)))
+            {
+                if (candidate.block != block)
+                {
+                    results.fallbacks.push_back({static_cast<int>(results.path.size()), candidate});
+                }
+            }
+        }
+        results.path.push_back({block, numTokens});
         currentNext = &block->next;
         ordinal++;
     }
@@ -716,9 +779,45 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
     {
         size_t beg = toSizeT(ordinal) * static_cast<size_t>(mTokensPerBlock);
         size_t missedCount = std::min(static_cast<size_t>(mTokensPerBlock), tokens.size() - beg);
-        auto [best, bestMatch] = findBestPartialMatchInNextNodes(*currentNext, tokens.data() + beg, missedCount);
-        if (best)
-            results.push_back({best, bestMatch});
+        auto candidates = findPartialMatchesInNextNodes(*currentNext, tokens.data() + beg, missedCount);
+        if (!candidates.empty())
+        {
+            // Try the longest raw match first, but pick the winner by how many
+            // tokens actually survive pruning. stable_sort keeps the (already
+            // unordered_map-defined) input order for equal-length candidates.
+            std::stable_sort(candidates.begin(), candidates.end(),
+                [](MatchResult const& a, MatchResult const& b) { return a.numMatchedTokens > b.numMatchedTokens; });
+            MatchResult const* best = nullptr;
+            int bestReusableTokens = -1;
+            for (auto const& candidate : candidates)
+            {
+                int const maxReusableTokens
+                    = mTokensPerBlock * static_cast<int>(results.path.size()) + candidate.numMatchedTokens;
+                // Candidates are sorted by descending raw match length, so once
+                // the upper bound cannot beat the incumbent, neither can the rest.
+                if (maxReusableTokens <= bestReusableTokens)
+                {
+                    break;
+                }
+                auto candidatePath = results.path;
+                candidatePath.push_back(candidate);
+                int const reusableTokens = pruneMatch(std::move(candidatePath)).numTokens;
+                if (reusableTokens > bestReusableTokens)
+                {
+                    best = &candidate;
+                    bestReusableTokens = reusableTokens;
+                }
+                if (reusableTokens == maxReusableTokens)
+                {
+                    break;
+                }
+            }
+            TLLM_CHECK_DEBUG(best != nullptr);
+            if (best != nullptr)
+            {
+                results.path.push_back(*best);
+            }
+        }
     }
 
     return results;
@@ -857,7 +956,37 @@ BlockRadixTree::ReuseMatch BlockRadixTree::pruneMatch(std::vector<MatchResult> m
 BlockRadixTree::ReuseMatch BlockRadixTree::match(
     ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch) const
 {
-    return pruneMatch(matchTokenPath(reuseScope, tokens, enablePartialMatch));
+    auto tokenPath = matchTokenPath(reuseScope, tokens, enablePartialMatch);
+    ReuseMatch best = pruneMatch(tokenPath.path);
+
+    // The exact token path can lead to blocks whose pages are no longer reusable
+    // (e.g. after commit_min_snapshot rewinds), while a sibling branching off
+    // earlier still is. Evaluate the recorded branch points, best-case first.
+    auto& fallbacks = tokenPath.fallbacks;
+    std::stable_sort(fallbacks.begin(), fallbacks.end(),
+        [this](FallbackCandidate const& a, FallbackCandidate const& b)
+        {
+            return mTokensPerBlock * a.prefixLen + a.candidate.numMatchedTokens
+                > mTokensPerBlock * b.prefixLen + b.candidate.numMatchedTokens;
+        });
+    for (auto const& fallback : fallbacks)
+    {
+        int const maxReusableTokens = mTokensPerBlock * fallback.prefixLen + fallback.candidate.numMatchedTokens;
+        // Sorted by descending upper bound, so the rest cannot win either.
+        if (maxReusableTokens <= best.numTokens)
+        {
+            break;
+        }
+        std::vector<MatchResult> fallbackPath(
+            tokenPath.path.begin(), tokenPath.path.begin() + static_cast<ptrdiff_t>(fallback.prefixLen));
+        fallbackPath.push_back(fallback.candidate);
+        auto fallbackMatch = pruneMatch(std::move(fallbackPath));
+        if (fallbackMatch.numTokens > best.numTokens)
+        {
+            best = std::move(fallbackMatch);
+        }
+    }
+    return best;
 }
 
 void BlockRadixTree::clear()

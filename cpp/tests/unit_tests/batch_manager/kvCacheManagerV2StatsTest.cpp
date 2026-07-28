@@ -28,6 +28,7 @@
 
 #include <limits>
 #include <memory>
+#include <optional>
 
 namespace
 {
@@ -219,7 +220,7 @@ TEST(KvCacheManagerV2StatsTest, PeakBlockStatsResetStartsNextIntervalFromCurrent
         {
             tokens.emplace_back(TokenId{token++});
         }
-        auto block = addOrGetExistingBlock(previous, LifeCycleId{1}, std::move(tokens));
+        auto block = addOrGetExistingBlock(previous, LifeCycleId{1}, std::move(tokens), std::nullopt);
         auto page = makeShared<CommittedPage>(&storage, block, lifeCycle, kGpuLevel, kPriorityDefault);
         page->setSlot(slot);
         block->storage[lifeCycle] = page.get();
@@ -310,7 +311,7 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
             {
                 tokens.emplace_back(TokenId{tokenBase++});
             }
-            auto block = addOrGetExistingBlock(previous, LifeCycleId{1}, std::move(tokens));
+            auto block = addOrGetExistingBlock(previous, LifeCycleId{1}, std::move(tokens), std::nullopt);
             auto page = makeShared<CommittedPage>(&storage, block, lifeCycle, kGpuLevel, kPriorityDefault);
             page->setSlot(slot);
             block->storage[lifeCycle] = page.get();
